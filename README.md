@@ -23,8 +23,8 @@
 
 ## News
 
-- **[2024.XX]** Code released!
-- **[2024.XX]** Paper accepted to ECCV 2024!
+- **[2026.1.1]** Code released!
+- **[2026.x.xx]** Paper Submitted to ECCV 2026!
 
 ## Results
 
