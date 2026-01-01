@@ -578,6 +578,11 @@ def main():
 
     print(f"Dataset size: {len(dataset)}")
 
+    # Update label_dim from dataset if it differs from config
+    if hasattr(dataset, 'label_dim') and dataset.label_dim != config.model.label_dim:
+        print(f"Updating label_dim from {config.model.label_dim} to {dataset.label_dim}")
+        config.model.label_dim = dataset.label_dim
+
     dataloader = DataLoader(
         dataset,
         batch_size=config.training.batch_gpu,
@@ -592,7 +597,7 @@ def main():
 
     # Resume from checkpoint if specified
     if args.resume:
-        checkpoint = torch.load(args.resume, map_location=device)
+        checkpoint = torch.load(args.resume, map_location=device, weights_only=False)
         trainer.generator.load_state_dict(checkpoint['generator'])
         trainer.ema_generator.load_state_dict(checkpoint['ema_generator'])
         trainer.optimizer.load_state_dict(checkpoint['optimizer'])
