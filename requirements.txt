@@ -16,6 +16,7 @@ Pillow>=8.0.0
 
 # Metrics
 # clean-fid>=0.1.35  # Optional: for FID calculation
+lpips>=0.1.4  # For LPIPS perceptual loss
 
 # Visualization
 matplotlib>=3.5.0

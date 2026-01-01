@@ -597,3 +597,340 @@ class OneStepGenerator(nn.Module):
             device=device
         )
         return self.forward(z, class_labels)
+
+
+# ============================================================================
+# Enhanced Generator with Boundary Conditions (from Boundary RF paper)
+# ============================================================================
+
+class BoundaryConditionedGenerator(nn.Module):
+    """
+    One-step generator with boundary condition enforcement.
+
+    From "Improving Rectified Flow with Boundary Conditions":
+    Enforces v(x, 1) = x to ensure trajectory straightness.
+
+    Supports two parameterization types:
+    - mask: v(x,t) = g(t)*(C-x) + f(t)*x + h(t)*m_theta(x,t)
+    - subtraction: v(x,t) = x - f_theta(x,t)
+    """
+
+    def __init__(
+        self,
+        img_resolution: int,
+        img_channels: int,
+        label_dim: int = 0,
+        sigma_data: float = 0.5,
+        use_fp16: bool = False,
+        boundary_type: str = "mask",  # "mask" or "subtraction"
+        **model_kwargs,
+    ):
+        super().__init__()
+
+        self.img_resolution = img_resolution
+        self.img_channels = img_channels
+        self.label_dim = label_dim
+        self.sigma_data = sigma_data
+        self.use_fp16 = use_fp16
+        self.boundary_type = boundary_type
+
+        # Backbone network
+        self.model = SongUNet(
+            img_resolution=img_resolution,
+            in_channels=img_channels,
+            out_channels=img_channels,
+            label_dim=label_dim,
+            **model_kwargs
+        )
+
+    def _mask_parameterization(
+        self,
+        z: torch.Tensor,
+        t: torch.Tensor,
+        raw_output: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Mask-based boundary parameterization.
+
+        v(x,t) = g(t)*(C-x) + f(t)*x + h(t)*m_theta(x,t)
+
+        where:
+        - g(t) = 0 at t=1 (no movement towards constant C)
+        - f(t) = 1 at t=1 (identity at boundary)
+        - h(t) = 0 at t=1 (no network contribution at boundary)
+        """
+        t = t.view(-1, 1, 1, 1)
+
+        # Boundary functions (satisfy v(x,1) = x)
+        g_t = 1.0 - t  # g(1) = 0
+        f_t = t  # f(1) = 1
+        h_t = (1.0 - t) * t  # h(0) = h(1) = 0, peak at t=0.5
+
+        # Constant C (can be learned or fixed)
+        C = torch.zeros_like(z)  # Target is "clean" image
+
+        # Parameterized output
+        output = g_t * (C - z) + f_t * z + h_t * raw_output
+
+        return output
+
+    def _subtraction_parameterization(
+        self,
+        z: torch.Tensor,
+        t: torch.Tensor,
+        raw_output: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Subtraction-based boundary parameterization.
+
+        v(x,t) = x + (1-t) * f_theta(x,t)
+
+        At t=1: v(x,1) = x (identity)
+        """
+        t = t.view(-1, 1, 1, 1)
+
+        # Scale network output by (1-t)
+        output = z + (1.0 - t) * raw_output
+
+        return output
+
+    def forward(
+        self,
+        z: torch.Tensor,
+        class_labels: Optional[torch.Tensor] = None,
+        t: Optional[torch.Tensor] = None,
+        augment_labels: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """
+        Generate images with boundary condition enforcement.
+
+        Args:
+            z: Input noise (B, C, H, W)
+            class_labels: Optional class labels
+            t: Time values (B,), defaults to sigma_data
+            augment_labels: Optional augmentation labels
+
+        Returns:
+            Generated images with boundary conditions satisfied
+        """
+        z = z.to(torch.float32)
+        batch_size = z.shape[0]
+        device = z.device
+
+        # Default time to sigma_data (one-step generation)
+        if t is None:
+            t = torch.ones(batch_size, device=device) * self.sigma_data
+
+        # Preconditioning
+        sigma = t * self.sigma_data
+        dtype = torch.float16 if (self.use_fp16 and device.type == 'cuda') else torch.float32
+
+        c_skip = self.sigma_data ** 2 / (sigma ** 2 + self.sigma_data ** 2)
+        c_out = sigma * self.sigma_data / (sigma ** 2 + self.sigma_data ** 2).sqrt()
+        c_in = 1 / (self.sigma_data ** 2 + sigma ** 2).sqrt()
+        c_noise = sigma.log() / 4
+
+        c_skip = c_skip.view(-1, 1, 1, 1)
+        c_out = c_out.view(-1, 1, 1, 1)
+        c_in = c_in.view(-1, 1, 1, 1)
+
+        # Network forward pass
+        x_in = (c_in * z * sigma.view(-1, 1, 1, 1)).to(dtype)
+        raw_output = self.model(x_in, c_noise, class_labels, augment_labels)
+        raw_output = raw_output.to(torch.float32)
+
+        # Apply boundary parameterization
+        if self.boundary_type == "mask":
+            x = self._mask_parameterization(z, t, c_skip * z + c_out * raw_output)
+        elif self.boundary_type == "subtraction":
+            x = self._subtraction_parameterization(z, t, c_out * raw_output)
+        else:
+            # Fallback to standard EDM preconditioning
+            x = c_skip * z + c_out * raw_output
+
+        return x
+
+    @torch.no_grad()
+    def sample(
+        self,
+        batch_size: int,
+        device: torch.device,
+        class_labels: Optional[torch.Tensor] = None,
+        num_steps: int = 1,
+    ) -> torch.Tensor:
+        """
+        Sample images with optional multi-step generation.
+
+        Args:
+            batch_size: Number of images
+            device: Target device
+            class_labels: Optional labels
+            num_steps: Number of generation steps (1 for one-step)
+
+        Returns:
+            Generated images
+        """
+        z = torch.randn(
+            batch_size, self.img_channels, self.img_resolution, self.img_resolution,
+            device=device
+        )
+
+        if num_steps == 1:
+            return self.forward(z, class_labels)
+
+        # Multi-step Euler integration
+        x = z
+        dt = 1.0 / num_steps
+        for i in range(num_steps):
+            t = torch.ones(batch_size, device=device) * (1.0 - i * dt)
+            v = self.forward(x, class_labels, t) - x
+            x = x + v * dt
+
+        return x
+
+
+class FlowGuidedGenerator(nn.Module):
+    """
+    Generator with flow-guided distillation support.
+
+    From SlimFlow: Uses 2-step teacher to guide 1-step student.
+    """
+
+    def __init__(
+        self,
+        img_resolution: int,
+        img_channels: int,
+        label_dim: int = 0,
+        sigma_data: float = 0.5,
+        use_fp16: bool = False,
+        **model_kwargs,
+    ):
+        super().__init__()
+
+        self.img_resolution = img_resolution
+        self.img_channels = img_channels
+        self.label_dim = label_dim
+        self.sigma_data = sigma_data
+        self.use_fp16 = use_fp16
+
+        # Student (1-step) network
+        self.student = SongUNet(
+            img_resolution=img_resolution,
+            in_channels=img_channels,
+            out_channels=img_channels,
+            label_dim=label_dim,
+            **model_kwargs
+        )
+
+    def forward(
+        self,
+        z: torch.Tensor,
+        class_labels: Optional[torch.Tensor] = None,
+        augment_labels: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """One-step generation."""
+        z = z.to(torch.float32)
+
+        sigma = torch.ones(z.shape[0], device=z.device) * self.sigma_data
+        dtype = torch.float16 if (self.use_fp16 and z.device.type == 'cuda') else torch.float32
+
+        c_skip = self.sigma_data ** 2 / (sigma ** 2 + self.sigma_data ** 2)
+        c_out = sigma * self.sigma_data / (sigma ** 2 + self.sigma_data ** 2).sqrt()
+        c_in = 1 / (self.sigma_data ** 2 + sigma ** 2).sqrt()
+        c_noise = sigma.log() / 4
+
+        c_skip = c_skip.view(-1, 1, 1, 1)
+        c_out = c_out.view(-1, 1, 1, 1)
+        c_in = c_in.view(-1, 1, 1, 1)
+
+        x_in = (c_in * z * sigma.view(-1, 1, 1, 1)).to(dtype)
+        F_x = self.student(x_in, c_noise, class_labels, augment_labels)
+        x = c_skip * z + c_out * F_x.to(torch.float32)
+
+        return x
+
+    def forward_with_teacher(
+        self,
+        z: torch.Tensor,
+        teacher: nn.Module,
+        class_labels: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Forward pass returning both student output and teacher 2-step output.
+
+        For flow-guided distillation training.
+        """
+        # Student 1-step output
+        student_output = self.forward(z, class_labels)
+
+        # Teacher 2-step Euler
+        with torch.no_grad():
+            t_mid = 0.5
+            t1 = torch.ones(z.shape[0], device=z.device)
+            t2 = torch.ones(z.shape[0], device=z.device) * t_mid
+
+            # Step 1: z -> x_mid
+            x_mid = teacher(z, class_labels)
+            x_mid = z + (x_mid - z) * t_mid
+
+            # Step 2: x_mid -> x_final
+            x_final = teacher.forward(x_mid, class_labels)
+
+        return student_output, x_final
+
+    @torch.no_grad()
+    def sample(
+        self,
+        batch_size: int,
+        device: torch.device,
+        class_labels: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Sample images."""
+        z = torch.randn(
+            batch_size, self.img_channels, self.img_resolution, self.img_resolution,
+            device=device
+        )
+        return self.forward(z, class_labels)
+
+
+# ============================================================================
+# Factory Function
+# ============================================================================
+
+def create_generator(config) -> nn.Module:
+    """
+    Factory function to create generator from config.
+
+    Args:
+        config: Configuration object
+
+    Returns:
+        Generator module
+    """
+    model_kwargs = {
+        'model_channels': config.model.model_channels,
+        'channel_mult': config.model.channel_mult,
+        'num_blocks': config.model.num_blocks,
+        'attn_resolutions': config.model.attn_resolutions,
+        'dropout': config.model.dropout,
+    }
+
+    if hasattr(config.model, 'use_boundary_condition') and config.model.use_boundary_condition:
+        return BoundaryConditionedGenerator(
+            img_resolution=config.model.img_resolution,
+            img_channels=config.model.img_channels,
+            label_dim=config.model.label_dim,
+            sigma_data=config.model.sigma_data,
+            use_fp16=config.model.use_fp16,
+            boundary_type=config.model.boundary_type,
+            **model_kwargs,
+        )
+    else:
+        return OneStepGenerator(
+            img_resolution=config.model.img_resolution,
+            img_channels=config.model.img_channels,
+            label_dim=config.model.label_dim,
+            sigma_data=config.model.sigma_data,
+            use_fp16=config.model.use_fp16,
+            **model_kwargs,
+        )
