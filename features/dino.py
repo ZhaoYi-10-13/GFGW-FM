@@ -221,7 +221,9 @@ class GlobalFeatureMemoryBank:
         all_indices = []
         count = 0
 
-        for batch_idx, (images, _) in enumerate(dataloader):
+        for batch_idx, batch_data in enumerate(dataloader):
+            # Handle both (images, labels) and (images, labels, indices) formats
+            images = batch_data[0]
             if max_samples is not None and count >= max_samples:
                 break
 

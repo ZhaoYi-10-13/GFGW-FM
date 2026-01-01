@@ -32,7 +32,7 @@ def evaluate(
     """
     # Load checkpoint
     print(f"Loading checkpoint from {checkpoint_path}")
-    checkpoint = torch.load(checkpoint_path, map_location=device)
+    checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
     config = checkpoint['config']
 
     # Build model
@@ -99,7 +99,8 @@ def evaluate(
 
     # Load real samples
     print("Loading real samples...")
-    for images, _ in tqdm(dataloader):
+    for batch_data in tqdm(dataloader):
+        images = batch_data[0]
         if images.max() > 1:
             images = images.float() / 127.5 - 1
         all_real.append(images)

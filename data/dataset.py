@@ -426,6 +426,8 @@ class ImageNetDataset(Dataset):
             self.dataset = ImageFolder(root)
 
         self._images = None
+        # Dynamically detect number of classes
+        self._num_classes = len(self.dataset.classes)
 
     def __len__(self) -> int:
         return len(self.dataset)
@@ -438,7 +440,7 @@ class ImageNetDataset(Dataset):
         image = (image.numpy() * 255).astype(np.uint8)
 
         if self.use_labels:
-            label_onehot = np.zeros(1000, dtype=np.float32)
+            label_onehot = np.zeros(self._num_classes, dtype=np.float32)
             label_onehot[label] = 1
         else:
             label_onehot = np.zeros(0, dtype=np.float32)
@@ -455,7 +457,7 @@ class ImageNetDataset(Dataset):
 
     @property
     def label_dim(self) -> int:
-        return 1000 if self.use_labels else 0
+        return self._num_classes if self.use_labels else 0
 
 
 class InfiniteSampler(torch.utils.data.Sampler):
