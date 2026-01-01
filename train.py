@@ -1,4 +1,11 @@
-"""Main training script for GFGW-FM."""
+"""Enhanced training script for GFGW-FM.
+
+Incorporates all advanced techniques from:
+- ECM: Pseudo-Huber loss, adaptive weighting, EMA teacher
+- SlimFlow: Annealing reflow, H-Flip augmentation
+- Boundary RF: Boundary condition enforcement
+- TCM: Two-stage training, heavy-tailed time sampling
+"""
 
 import os
 import time
@@ -9,24 +16,39 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, Tuple
 import argparse
 
+# Handle different PyTorch versions for AMP
+try:
+    from torch.amp import autocast, GradScaler
+    AMP_DEVICE_TYPE = 'cuda'
+except ImportError:
+    from torch.cuda.amp import autocast, GradScaler
+    AMP_DEVICE_TYPE = None
+
 from configs.default import GFGWConfig, get_config, CONFIG_REGISTRY
-from models.networks import OneStepGenerator
+from models.networks import OneStepGenerator, BoundaryConditionedGenerator, create_generator
 from features.dino import DINOv2FeatureExtractor, GlobalFeatureMemoryBank
 from losses.ot_solver import OTMatchingModule
-from losses.flow_matching import GFGWFlowMatchingLoss
+from losses.flow_matching import GFGWFlowMatchingLoss, ComprehensiveFlowLoss, create_loss_fn
 from data.dataset import ImageFolderDataset, CIFAR10Dataset, LSUNDataset, ImageNetDataset
 from metrics.evaluation import FIDCalculator, TextureConsistencyScore
+from utils.scheduling import TrainingScheduler, TimeSampler
 
 
-class GFGWFMTrainer:
+class GFGWFMTrainerV2:
     """
-    Main trainer class for GFGW-FM.
+    Enhanced trainer for GFGW-FM.
 
-    Implements Algorithm 1 from the paper:
-    Global Fused Gromov-Wasserstein Flow Matching
+    Key improvements over V1:
+    1. Two-stage training (TCM)
+    2. Adaptive loss weighting (ECM)
+    3. Time sampling distributions (TCM)
+    4. Annealing schedules (SlimFlow)
+    5. Boundary condition enforcement (Boundary RF)
+    6. Mixed precision training
+    7. Enhanced EMA with teacher model
     """
 
     def __init__(
@@ -41,20 +63,33 @@ class GFGWFMTrainer:
         self.device = device
         self.rank = rank
         self.world_size = world_size
-        self.dataset = dataset  # Store dataset reference for OT matching
+        self.dataset = dataset
 
         self._setup_logging()
         self._build_model()
         self._build_feature_extractor()
         self._build_loss()
         self._build_optimizer()
+        self._build_scheduler()
 
-        # OT solver and memory bank will be initialized in train()
+        # OT solver and memory bank (initialized in train())
         self.memory_bank = None
         self.ot_solver = None
-
-        # Cache for storing all dataset images (for OT target fetching)
         self._image_cache = None
+
+        # Mixed precision scaler
+        self.use_amp = config.training.use_amp
+        if self.use_amp:
+            if AMP_DEVICE_TYPE is not None:
+                self.scaler = GradScaler('cuda')
+            else:
+                self.scaler = GradScaler()
+        else:
+            self.scaler = None
+
+        # Training state
+        self.cur_nimg = 0
+        self.cur_step = 0
 
     def _setup_logging(self):
         """Setup logging and checkpointing."""
@@ -64,28 +99,29 @@ class GFGWFMTrainer:
                 os.path.join(self.config.log.run_dir, 'stats.jsonl'), 'a'
             )
 
+            # Save config
+            config_path = os.path.join(self.config.log.run_dir, 'config.json')
+            # Note: dataclass to dict conversion would go here
+
     def _build_model(self):
-        """Build the one-step generator model."""
+        """Build the generator model."""
         self.print0("Building generator model...")
 
-        self.generator = OneStepGenerator(
-            img_resolution=self.config.model.img_resolution,
-            img_channels=self.config.model.img_channels,
-            label_dim=self.config.model.label_dim,
-            sigma_data=self.config.model.sigma_data,
-            model_channels=self.config.model.model_channels,
-            channel_mult=self.config.model.channel_mult,
-            num_blocks=self.config.model.num_blocks,
-            attn_resolutions=self.config.model.attn_resolutions,
-            dropout=self.config.model.dropout,
-            use_fp16=self.config.model.use_fp16,
-        ).to(self.device)
+        # Use factory function for model creation
+        self.generator = create_generator(self.config).to(self.device)
 
-        # EMA model
+        # EMA model (also as teacher for consistency loss)
         self.ema_generator = copy.deepcopy(self.generator)
         self.ema_generator.eval().requires_grad_(False)
 
-        # Wrap with DDP if distributed
+        # Teacher model for consistency training (ECM style)
+        if self.config.training.use_teacher_forcing:
+            self.teacher_generator = copy.deepcopy(self.generator)
+            self.teacher_generator.eval().requires_grad_(False)
+        else:
+            self.teacher_generator = None
+
+        # DDP wrapper
         if self.world_size > 1:
             self.generator_ddp = nn.parallel.DistributedDataParallel(
                 self.generator,
@@ -95,7 +131,8 @@ class GFGWFMTrainer:
         else:
             self.generator_ddp = self.generator
 
-        self.print0(f"Generator parameters: {sum(p.numel() for p in self.generator.parameters()):,}")
+        num_params = sum(p.numel() for p in self.generator.parameters())
+        self.print0(f"Generator parameters: {num_params:,}")
 
     def _build_feature_extractor(self):
         """Build DINOv2 feature extractor."""
@@ -110,28 +147,48 @@ class GFGWFMTrainer:
 
     def _build_loss(self):
         """Build loss functions."""
-        self.loss_fn = GFGWFlowMatchingLoss(
-            sigma_data=self.config.model.sigma_data,
-            flow_loss_weight=self.config.training.flow_loss_weight,
-            feature_loss_weight=self.config.training.feature_loss_weight,
-        )
+        self.print0("Building loss functions...")
+
+        # Use comprehensive loss with all enhancements
+        self.loss_fn = create_loss_fn(self.config).to(self.device)
 
     def _build_optimizer(self):
-        """Build optimizer."""
-        self.optimizer = torch.optim.AdamW(
-            self.generator.parameters(),
-            lr=self.config.training.lr,
-            betas=self.config.training.betas,
-            weight_decay=self.config.training.weight_decay,
-        )
+        """Build optimizer with optional learning rate schedule."""
+        self.print0("Building optimizer...")
+
+        if self.config.training.use_adam_w:
+            self.optimizer = torch.optim.AdamW(
+                self.generator.parameters(),
+                lr=self.config.training.lr,
+                betas=self.config.training.betas,
+                weight_decay=self.config.training.weight_decay,
+            )
+        else:
+            self.optimizer = torch.optim.Adam(
+                self.generator.parameters(),
+                lr=self.config.training.lr,
+                betas=self.config.training.betas,
+            )
+
+    def _build_scheduler(self):
+        """Build training scheduler for all dynamic parameters."""
+        self.print0("Building training scheduler...")
+        self.scheduler = TrainingScheduler(self.config)
 
     def print0(self, *args, **kwargs):
         """Print only on rank 0."""
         if self.rank == 0:
             print(*args, **kwargs)
 
+    def _autocast(self):
+        """Return autocast context manager compatible with PyTorch version."""
+        if AMP_DEVICE_TYPE is not None:
+            return autocast(device_type=AMP_DEVICE_TYPE, enabled=self.use_amp)
+        else:
+            return autocast(enabled=self.use_amp)
+
     def _update_ema(self, cur_nimg: int):
-        """Update EMA model."""
+        """Update EMA model with adaptive decay."""
         ema_halflife_nimg = self.config.training.ema_halflife_kimg * 1000
 
         if self.config.training.ema_rampup_ratio is not None:
@@ -145,6 +202,19 @@ class GFGWFMTrainer:
         for p_ema, p_net in zip(self.ema_generator.parameters(), self.generator.parameters()):
             p_ema.copy_(p_net.detach().lerp(p_ema, ema_beta))
 
+    def _update_teacher(self, cur_step: int):
+        """Update teacher model (for ECM-style consistency training)."""
+        if self.teacher_generator is None:
+            return
+
+        if cur_step % self.config.training.teacher_update_interval != 0:
+            return
+
+        ema_decay = self.config.training.teacher_ema_decay
+
+        for p_teacher, p_net in zip(self.teacher_generator.parameters(), self.generator.parameters()):
+            p_teacher.copy_(p_net.detach().lerp(p_teacher, ema_decay))
+
     def _save_checkpoint(self, cur_kimg: int, is_latest: bool = False):
         """Save model checkpoint."""
         if self.rank != 0:
@@ -154,9 +224,16 @@ class GFGWFMTrainer:
             'generator': self.generator.state_dict(),
             'ema_generator': self.ema_generator.state_dict(),
             'optimizer': self.optimizer.state_dict(),
-            'config': self.config,
             'cur_kimg': cur_kimg,
+            'cur_nimg': self.cur_nimg,
+            'cur_step': self.cur_step,
         }
+
+        if self.teacher_generator is not None:
+            data['teacher_generator'] = self.teacher_generator.state_dict()
+
+        if self.scaler is not None:
+            data['scaler'] = self.scaler.state_dict()
 
         if is_latest:
             path = os.path.join(self.config.log.run_dir, 'checkpoint_latest.pt')
@@ -198,26 +275,33 @@ class GFGWFMTrainer:
         return images
 
     def _get_images_by_indices(self, indices: torch.Tensor) -> torch.Tensor:
-        """
-        Get images from dataset by indices.
-        This is crucial for OT-based training.
-        """
+        """Get images from dataset by indices."""
         if hasattr(self.dataset, 'get_images_by_indices'):
             images = self.dataset.get_images_by_indices(indices)
         else:
-            # Fallback: load images one by one
             images = []
             for idx in indices.cpu().numpy():
                 img, _, _ = self.dataset[int(idx)]
                 images.append(torch.from_numpy(img))
             images = torch.stack(images, dim=0)
 
-        # Normalize to [-1, 1] if needed
         images = images.float().to(self.device)
         if images.max() > 1:
             images = images / 127.5 - 1
 
         return images
+
+    def _apply_augmentation(
+        self,
+        images: torch.Tensor,
+        generated: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Apply data augmentation (H-Flip from SlimFlow)."""
+        if self.config.training.use_hflip and torch.rand(1) > 0.5:
+            images = torch.flip(images, dims=[-1])
+            generated = torch.flip(generated, dims=[-1])
+
+        return images, generated
 
     def train_step(
         self,
@@ -226,29 +310,58 @@ class GFGWFMTrainer:
         real_indices: torch.Tensor,
     ) -> Dict[str, float]:
         """
-        Perform one training step following Algorithm 1.
+        Perform one training step with all enhancements.
 
         Key steps:
-        1. Sample z ~ N(0,I) and generate x = G_θ(z)
-        2. Compute features u = f(x_gen), get features v from memory bank
-        3. Compute FGW cost and solve for optimal coupling π
-        4. Sample matched targets from coupling
-        5. Update generator via flow matching loss
+        1. Sample time values using scheduler
+        2. Sample z and generate x = G_θ(z)
+        3. Apply augmentations
+        4. Compute features and solve FGW OT
+        5. Get matched targets
+        6. Compute comprehensive loss
+        7. Update parameters
         """
         batch_size = real_images.shape[0]
         device = real_images.device
+
+        # Get current schedule values
+        schedule_state = self.scheduler.get_state(self.cur_step)
+        current_epsilon = schedule_state['epsilon']
+        current_fgw_lambda = schedule_state['fgw_lambda']
+
+        # Sample time values (using heavy-tailed distribution)
+        t = self.scheduler.sample_time(batch_size, device, self.cur_step)
 
         # Step 1: Sample latent codes and generate images
         z = torch.randn_like(real_images)
 
         self.generator.train()
-        generated = self.generator(z, real_labels)
 
-        # Step 2: Extract features for generated images
+        # Mixed precision forward pass
+        with self._autocast():
+            # Generate with time conditioning if using boundary conditions
+            if isinstance(self.generator, BoundaryConditionedGenerator):
+                generated = self.generator(z, real_labels, t)
+            else:
+                generated = self.generator(z, real_labels)
+
+        # Apply augmentations
+        if self.config.training.use_hflip:
+            real_images, generated = self._apply_augmentation(real_images, generated.detach())
+            # Re-generate after augmentation for gradient computation
+            if self.config.training.use_hflip and torch.rand(1) > 0.5:
+                z = torch.flip(z, dims=[-1])
+                with self._autocast():
+                    if isinstance(self.generator, BoundaryConditionedGenerator):
+                        generated = self.generator(z, real_labels, t)
+                    else:
+                        generated = self.generator(z, real_labels)
+
+        # Step 2: Extract features
         with torch.no_grad():
             features_gen = self.feature_extractor(generated.detach())
 
-            # Get features from memory bank (representing full dataset)
+            # Get features from memory bank
             ot_batch_size = min(self.config.ot.memory_batch_size, self.memory_bank.num_valid)
             memory_features, memory_indices, memory_distances = self.memory_bank.sample_subset(
                 size=ot_batch_size,
@@ -258,63 +371,82 @@ class GFGWFMTrainer:
             # Compute distance matrix for generated samples
             D_gen = torch.cdist(features_gen, features_gen, p=2)
 
-            # Step 3: Compute OT coupling using FGW
+            # Step 3: Compute OT coupling using FGW with current schedule
             coupling, cost_matrix = self.ot_solver(
                 features_gen=features_gen,
                 features_real=memory_features,
                 D_gen=D_gen,
                 D_real=memory_distances,
                 data_indices=memory_indices,
+                epsilon=current_epsilon,
+                fgw_lambda=current_fgw_lambda,
             )
 
-            # Step 4: Sample matched targets from coupling
-            # Use argmax for deterministic Monge map (as per paper)
+            # Step 4: Get matched targets
             assignments = coupling.argmax(dim=1)
-
-            # Map to actual dataset indices
             matched_dataset_indices = memory_indices[assignments]
-
-            # Fetch the matched target images from dataset
             matched_targets = self._get_images_by_indices(matched_dataset_indices)
-
-            # Get matched features for feature loss
             matched_features = memory_features[assignments]
 
-        # Step 5: Compute loss and update generator
-        # Re-generate with gradient for backprop
-        generated = self.generator(z, real_labels)
-        features_gen_grad = self.feature_extractor.forward(generated)
+        # Step 5: Re-generate with gradient and compute loss
+        with self._autocast():
+            if isinstance(self.generator, BoundaryConditionedGenerator):
+                generated = self.generator(z, real_labels, t)
+            else:
+                generated = self.generator(z, real_labels)
 
-        losses = self.loss_fn(
-            generated=generated,
-            matched_targets=matched_targets,
-            features_gen=features_gen_grad,
-            features_target=matched_features,
-            coupling=coupling,
-        )
+            features_gen_grad = self.feature_extractor.forward(generated)
 
-        # Backward pass
-        self.optimizer.zero_grad()
-        losses['total_loss'].backward()
-
-        # Gradient clipping
-        if self.config.training.grad_clip > 0:
-            nn.utils.clip_grad_norm_(
-                self.generator.parameters(),
-                self.config.training.grad_clip
+            # Comprehensive loss with all components
+            losses = self.loss_fn(
+                generated=generated,
+                matched_targets=matched_targets,
+                features_gen=features_gen_grad,
+                features_target=matched_features,
+                coupling=coupling,
+                noise=z,
+                t=t,
             )
 
-        self.optimizer.step()
+        # Step 6: Backward pass with mixed precision
+        self.optimizer.zero_grad()
+
+        if self.use_amp:
+            self.scaler.scale(losses['total_loss']).backward()
+
+            # Gradient clipping
+            if self.config.training.grad_clip > 0:
+                self.scaler.unscale_(self.optimizer)
+                nn.utils.clip_grad_norm_(
+                    self.generator.parameters(),
+                    self.config.training.grad_clip
+                )
+
+            self.scaler.step(self.optimizer)
+            self.scaler.update()
+        else:
+            losses['total_loss'].backward()
+
+            if self.config.training.grad_clip > 0:
+                nn.utils.clip_grad_norm_(
+                    self.generator.parameters(),
+                    self.config.training.grad_clip
+                )
+
+            self.optimizer.step()
+
+        # Update step counter
+        self.cur_step += 1
 
         return {k: v.item() for k, v in losses.items()}
 
     def train(self, dataloader: DataLoader):
-        """
-        Main training loop implementing Algorithm 1.
-        """
-        self.print0("Starting GFGW-FM training...")
+        """Main training loop with all enhancements."""
+        self.print0("=" * 60)
+        self.print0("Starting GFGW-FM V2 Training")
+        self.print0("=" * 60)
 
-        # Initialize memory bank with full dataset features
+        # Initialize memory bank
         dataset_size = len(dataloader.dataset)
         self.print0(f"Dataset size: {dataset_size}")
 
@@ -324,14 +456,14 @@ class GFGWFMTrainer:
             device=self.device,
         )
 
-        # Pre-compute features for entire dataset (as per paper)
+        # Pre-compute features for entire dataset
         self.print0("Pre-computing dataset features for global memory bank...")
         self.memory_bank.initialize_from_dataset(
             feature_extractor=self.feature_extractor,
             dataloader=dataloader,
         )
 
-        # Pre-compute structure distance matrix for real data
+        # Pre-compute structure distance matrix
         self.print0("Computing structure distance matrix...")
         self.memory_bank.compute_distance_matrix(
             use_cosine=self.config.ot.use_cosine_distance
@@ -351,16 +483,18 @@ class GFGWFMTrainer:
         )
 
         self.print0("Starting training loop...")
+        self.print0(f"Two-stage training: {self.config.schedule.use_two_stage}")
+        self.print0(f"Time sampling: {self.config.schedule.time_sampling}")
+        self.print0(f"Mixed precision: {self.use_amp}")
 
         # Training loop
-        cur_nimg = 0
         cur_tick = 0
         tick_start_time = time.time()
 
         total_kimg = self.config.training.total_kimg
         data_iter = iter(dataloader)
 
-        while cur_nimg < total_kimg * 1000:
+        while self.cur_nimg < total_kimg * 1000:
             # Get batch
             try:
                 batch_data = next(data_iter)
@@ -368,7 +502,7 @@ class GFGWFMTrainer:
                 data_iter = iter(dataloader)
                 batch_data = next(data_iter)
 
-            # Handle both (images, labels) and (images, labels, indices) formats
+            # Handle batch format
             if len(batch_data) == 3:
                 images, labels, indices = batch_data
             else:
@@ -384,31 +518,44 @@ class GFGWFMTrainer:
             labels = labels.to(self.device) if self.config.model.label_dim > 0 else None
             indices = indices.to(self.device)
 
+            # Update learning rate
+            current_lr = self.scheduler.step_optimizer(self.optimizer, self.cur_step)
+
             # Training step
             losses = self.train_step(images, labels, indices)
 
-            # Update EMA
-            cur_nimg += images.shape[0]
-            self._update_ema(cur_nimg)
+            # Update EMA and teacher
+            self.cur_nimg += images.shape[0]
+            self._update_ema(self.cur_nimg)
+            self._update_teacher(self.cur_step)
 
             # Logging
-            cur_kimg = cur_nimg // 1000
+            cur_kimg = self.cur_nimg // 1000
 
             if cur_kimg > cur_tick:
                 elapsed = time.time() - tick_start_time
+                schedule_state = self.scheduler.get_state(self.cur_step)
+
                 self.print0(
                     f"kimg {cur_kimg:>6d} | "
                     f"loss {losses['total_loss']:.4f} | "
                     f"flow {losses['flow_loss']:.4f} | "
                     f"feat {losses['feature_loss']:.4f} | "
+                    f"lr {current_lr:.2e} | "
+                    f"eps {schedule_state['epsilon']:.3f} | "
+                    f"t_range {schedule_state['time_range']} | "
                     f"sec/kimg {elapsed:.1f}"
                 )
 
                 self._log_stats({
                     'kimg': cur_kimg,
+                    'step': self.cur_step,
                     'loss': losses['total_loss'],
                     'flow_loss': losses['flow_loss'],
                     'feature_loss': losses['feature_loss'],
+                    'lr': current_lr,
+                    'epsilon': schedule_state['epsilon'],
+                    'fgw_lambda': schedule_state['fgw_lambda'],
                     'timestamp': time.time(),
                 })
 
@@ -506,9 +653,16 @@ def save_image_grid(images, path, drange, grid_size=None):
         PIL.Image.fromarray(grid, 'RGB').save(path)
 
 
+# ============================================================================
+# Backward compatibility - original trainer
+# ============================================================================
+
+GFGWFMTrainer = GFGWFMTrainerV2
+
+
 def main():
     """Main entry point."""
-    parser = argparse.ArgumentParser(description='GFGW-FM Training')
+    parser = argparse.ArgumentParser(description='GFGW-FM V2 Training')
     parser.add_argument('--config', type=str, default='cifar10',
                         choices=list(CONFIG_REGISTRY.keys()),
                         help='Configuration preset to use')
@@ -524,6 +678,17 @@ def main():
                         help='Override learning rate from config')
     parser.add_argument('--total-kimg', type=int, default=None,
                         help='Override total training kimg')
+
+    # New arguments for enhanced training
+    parser.add_argument('--no-boundary', action='store_true',
+                        help='Disable boundary condition enforcement')
+    parser.add_argument('--no-two-stage', action='store_true',
+                        help='Disable two-stage training')
+    parser.add_argument('--no-lpips', action='store_true',
+                        help='Disable LPIPS loss')
+    parser.add_argument('--no-amp', action='store_true',
+                        help='Disable automatic mixed precision')
+
     args = parser.parse_args()
 
     # Get config from registry
@@ -532,6 +697,7 @@ def main():
     # Override config with command line args
     config.data.data_path = args.data_path
     config.log.run_dir = args.run_dir
+
     if args.batch_size is not None:
         config.training.batch_size = args.batch_size
     if args.lr is not None:
@@ -539,10 +705,20 @@ def main():
     if args.total_kimg is not None:
         config.training.total_kimg = args.total_kimg
 
+    # Apply feature flags
+    if args.no_boundary:
+        config.model.use_boundary_condition = False
+    if args.no_two_stage:
+        config.schedule.use_two_stage = False
+    if args.no_lpips:
+        config.loss.use_lpips = False
+    if args.no_amp:
+        config.training.use_amp = False
+
     # Setup device
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-    # Build dataset based on config
+    # Build dataset
     dataset_name = config.data.dataset_name
     print(f"Loading dataset: {dataset_name}")
 
@@ -553,7 +729,6 @@ def main():
             download=True,
         )
     elif 'lsun' in dataset_name:
-        # Extract category from dataset name (e.g., 'lsun_bedroom' -> 'bedroom')
         category = dataset_name.replace('lsun_', '')
         dataset = LSUNDataset(
             root=config.data.data_path,
@@ -569,7 +744,6 @@ def main():
             use_labels=config.data.use_labels,
         )
     else:
-        # Generic image folder dataset
         dataset = ImageFolderDataset(
             path=config.data.data_path,
             resolution=config.data.resolution,
@@ -578,7 +752,7 @@ def main():
 
     print(f"Dataset size: {len(dataset)}")
 
-    # Update label_dim from dataset if it differs from config
+    # Update label_dim
     if hasattr(dataset, 'label_dim') and dataset.label_dim != config.model.label_dim:
         print(f"Updating label_dim from {config.model.label_dim} to {dataset.label_dim}")
         config.model.label_dim = dataset.label_dim
@@ -592,15 +766,25 @@ def main():
         drop_last=True,
     )
 
-    # Build trainer with dataset reference
-    trainer = GFGWFMTrainer(config, dataset=dataset, device=device)
+    # Build trainer
+    trainer = GFGWFMTrainerV2(config, dataset=dataset, device=device)
 
-    # Resume from checkpoint if specified
+    # Resume from checkpoint
     if args.resume:
         checkpoint = torch.load(args.resume, map_location=device, weights_only=False)
         trainer.generator.load_state_dict(checkpoint['generator'])
         trainer.ema_generator.load_state_dict(checkpoint['ema_generator'])
         trainer.optimizer.load_state_dict(checkpoint['optimizer'])
+
+        if 'cur_nimg' in checkpoint:
+            trainer.cur_nimg = checkpoint['cur_nimg']
+        if 'cur_step' in checkpoint:
+            trainer.cur_step = checkpoint['cur_step']
+        if 'teacher_generator' in checkpoint and trainer.teacher_generator is not None:
+            trainer.teacher_generator.load_state_dict(checkpoint['teacher_generator'])
+        if 'scaler' in checkpoint and trainer.scaler is not None:
+            trainer.scaler.load_state_dict(checkpoint['scaler'])
+
         print(f"Resumed from {args.resume}")
 
     # Train

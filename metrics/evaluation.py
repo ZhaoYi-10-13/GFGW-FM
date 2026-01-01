@@ -19,7 +19,13 @@ class InceptionV3Features(nn.Module):
 
         # Load pretrained InceptionV3
         import torchvision.models as models
-        inception = models.inception_v3(pretrained=True, transform_input=False)
+        try:
+            # Try newer API first
+            from torchvision.models import Inception_V3_Weights
+            inception = models.inception_v3(weights=Inception_V3_Weights.IMAGENET1K_V1, transform_input=False)
+        except (ImportError, AttributeError):
+            # Fallback to older API
+            inception = models.inception_v3(pretrained=True, transform_input=False)
 
         # Extract feature layers (up to pool3)
         self.blocks = nn.ModuleList()
