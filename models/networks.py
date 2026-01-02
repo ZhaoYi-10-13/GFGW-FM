@@ -894,6 +894,85 @@ class FlowGuidedGenerator(nn.Module):
 
 
 # ============================================================================
+# ECM/TCM Compatible Preconditioning (for pretrained model loading)
+# ============================================================================
+
+class ECMPrecond(nn.Module):
+    """
+    ECM-style preconditioning wrapper.
+    
+    This is compatible with EDM/ECM/TCM pretrained models.
+    The key insight is that EDM uses specific preconditioning coefficients
+    that we need to match for successful transfer learning.
+    
+    From ECM paper: "Consistency Models Made Easy"
+    From TCM paper: "Truncated Consistency Models"
+    """
+    
+    def __init__(
+        self,
+        model: nn.Module,
+        img_resolution: int,
+        img_channels: int,
+        label_dim: int = 0,
+        sigma_data: float = 0.5,
+        sigma_min: float = 0.002,
+        sigma_max: float = 80.0,
+        use_fp16: bool = False,
+    ):
+        super().__init__()
+        self.model = model
+        self.img_resolution = img_resolution
+        self.img_channels = img_channels
+        self.label_dim = label_dim
+        self.sigma_data = sigma_data
+        self.sigma_min = sigma_min
+        self.sigma_max = sigma_max
+        self.use_fp16 = use_fp16
+    
+    def forward(
+        self,
+        x: torch.Tensor,
+        sigma: torch.Tensor,
+        class_labels: Optional[torch.Tensor] = None,
+        augment_labels: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """
+        Forward pass with EDM preconditioning.
+        
+        Args:
+            x: Noisy input images
+            sigma: Noise levels
+            class_labels: Optional class labels
+            augment_labels: Optional augmentation labels
+            
+        Returns:
+            Denoised images
+        """
+        x = x.to(torch.float32)
+        sigma = sigma.to(torch.float32).reshape(-1, 1, 1, 1)
+        
+        dtype = torch.float16 if (self.use_fp16 and x.device.type == 'cuda') else torch.float32
+        
+        # EDM preconditioning coefficients
+        c_skip = self.sigma_data ** 2 / (sigma ** 2 + self.sigma_data ** 2)
+        c_out = sigma * self.sigma_data / (sigma ** 2 + self.sigma_data ** 2).sqrt()
+        c_in = 1 / (self.sigma_data ** 2 + sigma ** 2).sqrt()
+        c_noise = sigma.flatten().log() / 4
+        
+        # Network forward
+        x_in = (c_in * x).to(dtype)
+        F_x = self.model(x_in, c_noise, class_labels, augment_labels)
+        D_x = c_skip * x + c_out * F_x.to(torch.float32)
+        
+        return D_x
+    
+    def round_sigma(self, sigma: torch.Tensor) -> torch.Tensor:
+        """Round sigma to avoid numerical issues."""
+        return torch.as_tensor(sigma)
+
+
+# ============================================================================
 # Factory Function
 # ============================================================================
 
@@ -934,3 +1013,47 @@ def create_generator(config) -> nn.Module:
             use_fp16=config.model.use_fp16,
             **model_kwargs,
         )
+
+
+def create_generator_with_pretrained(config) -> nn.Module:
+    """
+    Factory function to create generator with pretrained initialization.
+    
+    This is the recommended way to create a generator for ECCV-quality results.
+    It follows the same strategy as ECM/TCM papers.
+    
+    Args:
+        config: Configuration object with pretrained settings
+        
+    Returns:
+        Generator module with pretrained weights loaded
+    """
+    from utils.pretrained import PretrainedModelLoader
+    
+    # Create base generator
+    generator = create_generator(config)
+    
+    # Load pretrained weights if configured
+    if hasattr(config, 'pretrained') and config.pretrained.use_pretrained:
+        pretrained_cfg = config.pretrained
+        
+        # Determine source (URL or path)
+        source = pretrained_cfg.pretrained_path or pretrained_cfg.pretrained_url
+        
+        if source:
+            print(f"Loading pretrained weights from: {source}")
+            
+            loader = PretrainedModelLoader(verbose=True)
+            generator = loader.load_into_model(
+                model=generator,
+                path_or_url=source,
+                model_format=pretrained_cfg.model_format,
+                strict=pretrained_cfg.pretrained_strict,
+                use_ema=True,  # Always use EMA weights (they're better)
+            )
+            
+            print("Pretrained weights loaded successfully!")
+        else:
+            print("Warning: use_pretrained=True but no path/URL specified")
+    
+    return generator

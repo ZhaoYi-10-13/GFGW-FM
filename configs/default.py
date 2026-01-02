@@ -150,6 +150,33 @@ class ScheduleConfig:
 
 
 @dataclass
+class PretrainedConfig:
+    """Pretrained model configuration (from ECM/TCM best practices)."""
+    # Pretrained model loading
+    use_pretrained: bool = True  # Enable pretrained initialization
+    pretrained_path: Optional[str] = None  # Path to pretrained .pkl or .pt file
+    pretrained_url: Optional[str] = None  # URL for downloading pretrained model
+    pretrained_strict: bool = False  # Whether to require exact match
+    
+    # Supported pretrained models (from EDM/TCM)
+    # CIFAR-10: https://nvlabs-fi-cdn.nvidia.com/edm/pretrained/edm-cifar10-32x32-uncond-vp.pkl
+    # CIFAR-10 Cond: https://nvlabs-fi-cdn.nvidia.com/edm/pretrained/edm-cifar10-32x32-cond-vp.pkl
+    # ImageNet-64: edm2-img64-s-1073741-0.130.pkl (from EDM2)
+    # FFHQ-64: https://nvlabs-fi-cdn.nvidia.com/edm/pretrained/edm-ffhq-64x64-uncond-vp.pkl
+    
+    # Model format handling
+    model_format: str = "edm"  # "edm", "edm2", "ect", "tcm"
+    ema_key: str = "ema"  # Key for EMA weights in checkpoint
+    
+    # Transfer learning options
+    freeze_encoder: bool = False  # Freeze encoder weights initially
+    freeze_encoder_kimg: int = 0  # Unfreeze after this many kimg
+    
+    # Architecture adaptation
+    adapt_architecture: bool = True  # Adapt if architecture slightly differs
+
+
+@dataclass
 class TrainingConfig:
     """Training configuration."""
     batch_size: int = 128
@@ -190,6 +217,10 @@ class TrainingConfig:
     use_teacher_forcing: bool = True
     teacher_ema_decay: float = 0.9999
     teacher_update_interval: int = 1
+    
+    # [NEW] Learning rate for fine-tuning pretrained models
+    # (smaller LR recommended when using pretrained initialization)
+    finetune_lr_multiplier: float = 0.1  # LR = lr * multiplier when finetuning
 
 
 @dataclass
@@ -256,6 +287,7 @@ class GFGWConfig:
     loss: LossConfig = field(default_factory=LossConfig)
     schedule: ScheduleConfig = field(default_factory=ScheduleConfig)
     training: TrainingConfig = field(default_factory=TrainingConfig)
+    pretrained: PretrainedConfig = field(default_factory=PretrainedConfig)  # [NEW] Pretrained model config
     data: DataConfig = field(default_factory=DataConfig)
     eval: EvalConfig = field(default_factory=EvalConfig)
     log: LogConfig = field(default_factory=LogConfig)
@@ -282,7 +314,23 @@ def get_cifar10_config() -> GFGWConfig:
     config.loss.huber_c = 0.00054 * np.sqrt(3 * 32 * 32)
     config.schedule.stage1_kimg = 10000
     config.training.total_kimg = 50000
+    
+    # [NEW] Pretrained model configuration (from EDM - same as ECM/TCM)
+    config.pretrained.use_pretrained = True
+    config.pretrained.pretrained_url = "https://nvlabs-fi-cdn.nvidia.com/edm/pretrained/edm-cifar10-32x32-uncond-vp.pkl"
+    config.pretrained.model_format = "edm"
+    
+    # Use smaller LR for fine-tuning (like ECM "1 GPU hour" setting)
+    config.training.lr = 1e-4
+    config.training.finetune_lr_multiplier = 1.0  # Already lower
 
+    return config
+
+
+def get_cifar10_cond_config() -> GFGWConfig:
+    """Get configuration for CIFAR-10 conditional."""
+    config = get_cifar10_config()
+    config.pretrained.pretrained_url = "https://nvlabs-fi-cdn.nvidia.com/edm/pretrained/edm-cifar10-32x32-cond-vp.pkl"
     return config
 
 
@@ -304,7 +352,16 @@ def get_imagenet64_config() -> GFGWConfig:
     config.loss.huber_c = 0.00054 * np.sqrt(3 * 64 * 64)
     config.schedule.stage1_kimg = 30000
     config.training.total_kimg = 200000
-
+    
+    # [NEW] Pretrained model configuration (from EDM2 - same as TCM)
+    config.pretrained.use_pretrained = True
+    # EDM2 ImageNet-64 model (S size, 280M params)
+    config.pretrained.pretrained_url = "https://nvlabs-fi-cdn.nvidia.com/edm2/posthoc-reconstructions/edm2-img64-s-1073741-0.130.pkl"
+    config.pretrained.model_format = "edm2"
+    
+    # Use smaller LR for fine-tuning
+    config.training.lr = 5e-5
+    
     return config
 
 
@@ -377,11 +434,29 @@ def get_lsun_cat_config() -> GFGWConfig:
 # Configuration registry for easy access
 CONFIG_REGISTRY = {
     'cifar10': get_cifar10_config,
+    'cifar10_cond': get_cifar10_cond_config,
     'imagenet64': get_imagenet64_config,
     'imagenet256': get_imagenet256_config,
     'lsun_bedroom': get_lsun_bedroom_config,
     'lsun_church': get_lsun_church_config,
     'lsun_cat': get_lsun_cat_config,
+}
+
+
+# Pretrained model URLs registry
+PRETRAINED_URLS = {
+    # EDM pretrained models (CIFAR-10)
+    'edm-cifar10-uncond': 'https://nvlabs-fi-cdn.nvidia.com/edm/pretrained/edm-cifar10-32x32-uncond-vp.pkl',
+    'edm-cifar10-cond': 'https://nvlabs-fi-cdn.nvidia.com/edm/pretrained/edm-cifar10-32x32-cond-vp.pkl',
+    
+    # EDM pretrained models (FFHQ)
+    'edm-ffhq64-uncond': 'https://nvlabs-fi-cdn.nvidia.com/edm/pretrained/edm-ffhq-64x64-uncond-vp.pkl',
+    
+    # EDM2 pretrained models (ImageNet-64)
+    'edm2-img64-s': 'https://nvlabs-fi-cdn.nvidia.com/edm2/posthoc-reconstructions/edm2-img64-s-1073741-0.130.pkl',
+    'edm2-img64-m': 'https://nvlabs-fi-cdn.nvidia.com/edm2/posthoc-reconstructions/edm2-img64-m-2147483-0.060.pkl',
+    'edm2-img64-l': 'https://nvlabs-fi-cdn.nvidia.com/edm2/posthoc-reconstructions/edm2-img64-l-1073741-0.030.pkl',
+    'edm2-img64-xl': 'https://nvlabs-fi-cdn.nvidia.com/edm2/posthoc-reconstructions/edm2-img64-xl-536870-0.015.pkl',
 }
 
 

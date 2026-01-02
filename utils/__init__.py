@@ -15,6 +15,14 @@ from .scheduling import (
     TrainingScheduler,
 )
 
+# Import pretrained model loading utilities (ECM/TCM compatible)
+from .pretrained import (
+    PretrainedModelLoader,
+    load_pretrained_edm_model,
+    create_ema_from_pretrained,
+    copy_params_and_buffers,
+)
+
 
 def set_seed(seed: int):
     """Set random seeds for reproducibility."""
@@ -67,4 +75,9 @@ __all__ = [
     'OTEpsilonSchedule',
     'FGWLambdaSchedule',
     'TrainingScheduler',
+    # Pretrained model loading (ECM/TCM compatible)
+    'PretrainedModelLoader',
+    'load_pretrained_edm_model',
+    'create_ema_from_pretrained',
+    'copy_params_and_buffers',
 ]
