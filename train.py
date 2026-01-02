@@ -27,8 +27,9 @@ except ImportError:
     from torch.cuda.amp import autocast, GradScaler
     AMP_DEVICE_TYPE = None
 
-from configs.default import GFGWConfig, get_config, CONFIG_REGISTRY
-from models.networks import OneStepGenerator, BoundaryConditionedGenerator, create_generator
+from configs.default import GFGWConfig, get_config, CONFIG_REGISTRY, PRETRAINED_URLS
+from models.networks import OneStepGenerator, BoundaryConditionedGenerator, create_generator, create_generator_with_pretrained
+from utils.pretrained import PretrainedModelLoader, load_pretrained_edm_model
 from features.dino import DINOv2FeatureExtractor, GlobalFeatureMemoryBank
 from losses.ot_solver import OTMatchingModule
 from losses.flow_matching import GFGWFlowMatchingLoss, ComprehensiveFlowLoss, create_loss_fn
@@ -104,20 +105,38 @@ class GFGWFMTrainerV2:
             # Note: dataclass to dict conversion would go here
 
     def _build_model(self):
-        """Build the generator model."""
+        """Build the generator model with optional pretrained initialization.
+        
+        Following ECM/TCM best practices:
+        - Load pretrained EDM/EDM2 weights for stable initialization
+        - Use EMA model as teacher for consistency training
+        - Support two-stage training (from TCM)
+        """
         self.print0("Building generator model...")
+        self.print0("=" * 60)
 
-        # Use factory function for model creation
-        self.generator = create_generator(self.config).to(self.device)
+        # Use factory function that handles pretrained loading
+        if hasattr(self.config, 'pretrained') and self.config.pretrained.use_pretrained:
+            self.print0("Using pretrained model initialization (ECM/TCM style)...")
+            self.generator = create_generator_with_pretrained(self.config).to(self.device)
+            self._pretrained_initialized = True
+        else:
+            self.print0("Training from scratch (no pretrained initialization)...")
+            self.generator = create_generator(self.config).to(self.device)
+            self._pretrained_initialized = False
 
         # EMA model (also as teacher for consistency loss)
+        # Following ECM: EMA model is crucial for stable training
         self.ema_generator = copy.deepcopy(self.generator)
         self.ema_generator.eval().requires_grad_(False)
+        self.print0("EMA model created")
 
-        # Teacher model for consistency training (ECM style)
+        # Teacher model for consistency training (ECM/TCM style)
+        # Key insight from TCM: Use a separate teacher for two-stage training
         if self.config.training.use_teacher_forcing:
             self.teacher_generator = copy.deepcopy(self.generator)
             self.teacher_generator.eval().requires_grad_(False)
+            self.print0("Teacher model created (for consistency training)")
         else:
             self.teacher_generator = None
 
@@ -133,6 +152,8 @@ class GFGWFMTrainerV2:
 
         num_params = sum(p.numel() for p in self.generator.parameters())
         self.print0(f"Generator parameters: {num_params:,}")
+        self.print0(f"Pretrained initialization: {self._pretrained_initialized}")
+        self.print0("=" * 60)
 
     def _build_feature_extractor(self):
         """Build DINOv2 feature extractor."""
@@ -688,6 +709,22 @@ def main():
                         help='Disable LPIPS loss')
     parser.add_argument('--no-amp', action='store_true',
                         help='Disable automatic mixed precision')
+    
+    # =========================================================================
+    # [NEW] Pretrained model arguments (following ECM/TCM best practices)
+    # =========================================================================
+    parser.add_argument('--pretrained', type=str, default=None,
+                        help='Path or URL to pretrained model (EDM/ECM/TCM format)')
+    parser.add_argument('--pretrained-key', type=str, default=None,
+                        choices=list(PRETRAINED_URLS.keys()),
+                        help='Use a predefined pretrained model (e.g., edm-cifar10-uncond)')
+    parser.add_argument('--no-pretrained', action='store_true',
+                        help='Disable pretrained initialization (train from scratch)')
+    parser.add_argument('--pretrained-format', type=str, default='auto',
+                        choices=['auto', 'edm', 'edm2', 'pytorch'],
+                        help='Format of pretrained checkpoint')
+    parser.add_argument('--pretrained-strict', action='store_true',
+                        help='Require exact parameter match for pretrained loading')
 
     args = parser.parse_args()
 
@@ -714,6 +751,48 @@ def main():
         config.loss.use_lpips = False
     if args.no_amp:
         config.training.use_amp = False
+    
+    # =========================================================================
+    # [NEW] Configure pretrained model loading (ECM/TCM best practices)
+    # =========================================================================
+    if args.no_pretrained:
+        # Explicitly disable pretrained
+        config.pretrained.use_pretrained = False
+        print("=" * 60)
+        print("Training from SCRATCH (--no-pretrained specified)")
+        print("Note: This may require longer training for competitive results")
+        print("=" * 60)
+    else:
+        # Handle pretrained configuration
+        if args.pretrained:
+            # Direct path/URL provided
+            config.pretrained.use_pretrained = True
+            if args.pretrained.startswith('http'):
+                config.pretrained.pretrained_url = args.pretrained
+            else:
+                config.pretrained.pretrained_path = args.pretrained
+            print(f"Using pretrained model: {args.pretrained}")
+        elif args.pretrained_key:
+            # Use predefined pretrained model
+            config.pretrained.use_pretrained = True
+            config.pretrained.pretrained_url = PRETRAINED_URLS[args.pretrained_key]
+            print(f"Using pretrained model: {args.pretrained_key}")
+            print(f"  URL: {config.pretrained.pretrained_url}")
+        
+        # Apply format and strict settings
+        if args.pretrained_format != 'auto':
+            config.pretrained.model_format = args.pretrained_format
+        if args.pretrained_strict:
+            config.pretrained.pretrained_strict = True
+        
+        if config.pretrained.use_pretrained:
+            print("=" * 60)
+            print("Using PRETRAINED initialization (ECM/TCM best practice)")
+            print("This enables:")
+            print("  - Faster convergence (like ECM '1 GPU hour' training)")
+            print("  - More stable training dynamics")
+            print("  - Fair comparison with other methods")
+            print("=" * 60)
 
     # Setup device
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
