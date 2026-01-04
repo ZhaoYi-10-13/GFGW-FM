@@ -419,11 +419,13 @@ class GFGWFMTrainerV2:
             features_gen_grad = self.feature_extractor.forward(generated)
 
             # Comprehensive loss with all components
+            # NOTE: For structure loss, we need the full memory_features, not just matched ones
             losses = self.loss_fn(
                 generated=generated,
                 matched_targets=matched_targets,
                 features_gen=features_gen_grad,
                 features_target=matched_features,
+                features_memory=memory_features,  # Full memory features for structure loss
                 coupling=coupling,
                 noise=z,
                 t=t,
@@ -459,7 +461,8 @@ class GFGWFMTrainerV2:
         # Update step counter
         self.cur_step += 1
 
-        return {k: v.item() for k, v in losses.items()}
+        # Convert losses to scalars, handling both tensors and floats
+        return {k: v.item() if torch.is_tensor(v) else v for k, v in losses.items()}
 
     def train(self, dataloader: DataLoader):
         """Main training loop with all enhancements."""

@@ -358,7 +358,7 @@ class StructurePreservationLoss(nn.Module):
 
         Args:
             features_gen: Generated features (n, d)
-            features_real: Real features (m, d)
+            features_real: Real features (m, d) - full memory bank features
             coupling: OT coupling matrix (n, m)
 
         Returns:
@@ -366,18 +366,21 @@ class StructurePreservationLoss(nn.Module):
         """
         # Compute pairwise distances
         D_gen = torch.cdist(features_gen, features_gen, p=2)
-        D_real = torch.cdist(features_real, features_real, p=2)
+        
+        # For structure loss, we use the matched samples from the memory bank
+        # Get the assignment from coupling (argmax over memory dimension)
+        with torch.no_grad():
+            assignments = coupling.argmax(dim=1)  # (n,)
+            matched_features = features_real[assignments]  # (n, d)
+        
+        D_matched = torch.cdist(matched_features, matched_features, p=2)
 
         if self.normalize:
             D_gen = D_gen / (D_gen.max() + 1e-8)
-            D_real = D_real / (D_real.max() + 1e-8)
+            D_matched = D_matched / (D_matched.max() + 1e-8)
 
-        # Compute expected distance matrix under coupling
-        # E[D_real | coupling] = coupling @ D_real @ coupling.T
-        D_real_transported = torch.mm(torch.mm(coupling, D_real), coupling.T)
-
-        # Loss is difference between generated and transported real distances
-        loss = F.mse_loss(D_gen, D_real_transported)
+        # Loss is difference between generated and matched distances
+        loss = F.mse_loss(D_gen, D_matched)
 
         return loss
 
