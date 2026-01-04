@@ -463,6 +463,7 @@ class GFGWFlowMatchingLoss(nn.Module):
         matched_targets: torch.Tensor,
         features_gen: Optional[torch.Tensor] = None,
         features_target: Optional[torch.Tensor] = None,
+        features_memory: Optional[torch.Tensor] = None,  # Full memory features for structure loss
         coupling: Optional[torch.Tensor] = None,
         noise: Optional[torch.Tensor] = None,
         t: Optional[torch.Tensor] = None,
@@ -474,8 +475,9 @@ class GFGWFlowMatchingLoss(nn.Module):
             generated: Generated images (B, C, H, W)
             matched_targets: OT-matched target images (B, C, H, W)
             features_gen: Generated sample features (B, d)
-            features_target: Target sample features (B, d)
-            coupling: OT coupling matrix
+            features_target: Target sample features (B, d) - matched features
+            features_memory: Full memory bank features (M, d) for structure loss
+            coupling: OT coupling matrix (B, M)
             noise: Input noise (for boundary loss)
             t: Time values (for adaptive weighting)
 
@@ -525,9 +527,12 @@ class GFGWFlowMatchingLoss(nn.Module):
             losses['boundary_loss'] = boundary * self.boundary_weight
 
         # 5. Structure preservation loss
-        if self.use_structure and coupling is not None and features_gen is not None and features_target is not None:
-            structure = self.structure_loss(features_gen, features_target, coupling)
-            losses['structure_loss'] = structure * self.structure_weight
+        if self.use_structure and coupling is not None and features_gen is not None:
+            # Use full memory features if available, otherwise fall back to matched features
+            features_for_structure = features_memory if features_memory is not None else features_target
+            if features_for_structure is not None:
+                structure = self.structure_loss(features_gen, features_for_structure, coupling)
+                losses['structure_loss'] = structure * self.structure_weight
 
         # Total loss
         total_loss = sum(losses.values())
@@ -616,6 +621,7 @@ class ComprehensiveFlowLoss(nn.Module):
         matched_targets: torch.Tensor,
         features_gen: Optional[torch.Tensor] = None,
         features_target: Optional[torch.Tensor] = None,
+        features_memory: Optional[torch.Tensor] = None,
         coupling: Optional[torch.Tensor] = None,
         noise: Optional[torch.Tensor] = None,
         t: Optional[torch.Tensor] = None,
@@ -627,6 +633,7 @@ class ComprehensiveFlowLoss(nn.Module):
             matched_targets=matched_targets,
             features_gen=features_gen,
             features_target=features_target,
+            features_memory=features_memory,
             coupling=coupling,
             noise=noise,
             t=t,
