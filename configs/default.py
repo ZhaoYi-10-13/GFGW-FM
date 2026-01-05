@@ -18,7 +18,10 @@ class ModelConfig:
     img_resolution: int = 32
     img_channels: int = 3
     model_channels: int = 128
-    channel_mult: Tuple[int, ...] = (1, 2, 2, 2)
+    # [FIXED] Match EDM/ECM architecture: [2,2,2] instead of (1,2,2,2)
+    # EDM CIFAR-10 uses model_channels=128, channel_mult=[2,2,2]
+    # This gives 256->256->256 channels at each resolution level
+    channel_mult: Tuple[int, ...] = (2, 2, 2)
     num_blocks: int = 4
     attn_resolutions: Tuple[int, ...] = (16,)
     dropout: float = 0.1

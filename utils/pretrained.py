@@ -63,35 +63,36 @@ def copy_params_and_buffers(
 ) -> None:
     """
     Copy parameters and buffers from source to destination module.
-    
+
     Based on EDM misc.copy_params_and_buffers implementation.
     This allows flexible loading even when architectures slightly differ.
     """
     assert isinstance(src_module, nn.Module)
     assert isinstance(dst_module, nn.Module)
-    
+
     src_tensors = dict(src_module.named_parameters())
     src_tensors.update(dict(src_module.named_buffers()))
-    
-    for name, tensor in dst_module.named_parameters():
-        if name in src_tensors:
-            if tensor.shape == src_tensors[name].shape:
-                tensor.copy_(src_tensors[name].detach()).requires_grad_(tensor.requires_grad)
+
+    with torch.no_grad():
+        for name, tensor in dst_module.named_parameters():
+            if name in src_tensors:
+                if tensor.shape == src_tensors[name].shape:
+                    tensor.copy_(src_tensors[name].detach())
+                else:
+                    print(f'Warning: Shape mismatch for {name}: '
+                          f'{tensor.shape} vs {src_tensors[name].shape}, skipping')
+            elif require_all:
+                raise KeyError(f'Missing parameter: {name}')
             else:
-                print(f'Warning: Shape mismatch for {name}: '
-                      f'{tensor.shape} vs {src_tensors[name].shape}, skipping')
-        elif require_all:
-            raise KeyError(f'Missing parameter: {name}')
-        else:
-            print(f'Warning: Missing parameter {name} in source, keeping random init')
-    
-    for name, buffer in dst_module.named_buffers():
-        if name in src_tensors:
-            if buffer.shape == src_tensors[name].shape:
-                buffer.copy_(src_tensors[name].detach())
-            else:
-                print(f'Warning: Shape mismatch for buffer {name}: '
-                      f'{buffer.shape} vs {src_tensors[name].shape}, skipping')
+                print(f'Warning: Missing parameter {name} in source, keeping random init')
+
+        for name, buffer in dst_module.named_buffers():
+            if name in src_tensors:
+                if buffer.shape == src_tensors[name].shape:
+                    buffer.copy_(src_tensors[name].detach())
+                else:
+                    print(f'Warning: Shape mismatch for buffer {name}: '
+                          f'{buffer.shape} vs {src_tensors[name].shape}, skipping')
 
 
 class PretrainedModelLoader:
