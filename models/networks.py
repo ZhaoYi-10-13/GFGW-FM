@@ -607,12 +607,27 @@ class BoundaryConditionedGenerator(nn.Module):
     """
     One-step generator with boundary condition enforcement.
 
-    From "Improving Rectified Flow with Boundary Conditions":
-    Enforces v(x, 1) = x to ensure trajectory straightness.
+    Correct implementation following "Improving Rectified Flow with Boundary Conditions":
 
-    Supports two parameterization types:
-    - mask: v(x,t) = g(t)*(C-x) + f(t)*x + h(t)*m_theta(x,t)
-    - subtraction: v(x,t) = x - f_theta(x,t)
+    Rectified Flow learns velocity field v(x_t, t) where:
+    - x_t = (1-t)*z + t*x_1 (linear interpolation from noise z to data x_1)
+    - The ideal velocity is v*(x_t, t) = x_1 - z (constant along trajectory)
+
+    Boundary conditions ensure:
+    - At t=0: x_0 = z (pure noise), full velocity available
+    - At t=1: x_1 = data, velocity should be minimal (we're at target)
+
+    Key insight from Boundary RF paper:
+    - Standard RF: v_θ(x_t, t) directly predicts velocity
+    - Boundary RF: v(x_t, t) = w(t) * v_θ(x_t, t) where w(1) → 0
+
+    Parameterizations:
+    - "none": v = v_θ (no boundary enforcement)
+    - "mask": v = (1-t) * v_θ (simple linear decay)
+    - "affine": v = a(t) * x_t + b(t) * v_θ (full affine from paper)
+      where a(t), b(t) satisfy boundary constraints
+
+    For one-step generation: x_1 = z + v(z, 0)
     """
 
     def __init__(
@@ -622,7 +637,7 @@ class BoundaryConditionedGenerator(nn.Module):
         label_dim: int = 0,
         sigma_data: float = 0.5,
         use_fp16: bool = False,
-        boundary_type: str = "mask",  # "mask" or "subtraction"
+        boundary_type: str = "affine",  # "mask", "affine", or "none"
         **model_kwargs,
     ):
         super().__init__()
@@ -634,7 +649,7 @@ class BoundaryConditionedGenerator(nn.Module):
         self.use_fp16 = use_fp16
         self.boundary_type = boundary_type
 
-        # Backbone network
+        # Backbone network predicts denoised output (EDM-style)
         self.model = SongUNet(
             img_resolution=img_resolution,
             in_channels=img_channels,
@@ -643,112 +658,135 @@ class BoundaryConditionedGenerator(nn.Module):
             **model_kwargs
         )
 
-    def _mask_parameterization(
-        self,
-        z: torch.Tensor,
-        t: torch.Tensor,
-        raw_output: torch.Tensor,
-    ) -> torch.Tensor:
+    def _boundary_coefficients(self, t: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """
-        Mask-based boundary parameterization.
+        Compute boundary parameterization coefficients.
 
-        v(x,t) = g(t)*(C-x) + f(t)*x + h(t)*m_theta(x,t)
+        From Boundary RF paper, the affine parameterization is:
+        v(x_t, t) = a(t) * x_t + b(t) * F_θ(x_t, t)
 
-        where:
-        - g(t) = 0 at t=1 (no movement towards constant C)
-        - f(t) = 1 at t=1 (identity at boundary)
-        - h(t) = 0 at t=1 (no network contribution at boundary)
+        For t ∈ [0, 1]:
+        - a(t) = -t / (1 - t + eps)  # Coefficient for input
+        - b(t) = 1 / (1 - t + eps)   # Coefficient for network output
+
+        This ensures: v(x_t, t) = (F_θ - t*x_t) / (1-t) = (x_1_pred - x_t) / (1-t)
+        At t=1: multiplied by (1-t) later, so v → 0
         """
-        t = t.view(-1, 1, 1, 1)
+        t_view = t.view(-1, 1, 1, 1)
+        eps = 1e-5
 
-        # Boundary functions (satisfy v(x,1) = x)
-        g_t = 1.0 - t  # g(1) = 0
-        f_t = t  # f(1) = 1
-        h_t = (1.0 - t) * t  # h(0) = h(1) = 0, peak at t=0.5
+        if self.boundary_type == "none":
+            # No boundary enforcement - direct output
+            a = torch.zeros_like(t_view)
+            b = torch.ones_like(t_view)
+        elif self.boundary_type == "mask":
+            # Simple mask: scale velocity by (1-t)
+            a = torch.zeros_like(t_view)
+            b = (1.0 - t_view)
+        elif self.boundary_type == "affine":
+            # Full affine from Boundary RF paper
+            # v = (D_θ(x_t) - x_t) / (1 - t) naturally goes to 0 as t → 1
+            # because D_θ(x_1) ≈ x_1 when t=1
+            a = -t_view / (1.0 - t_view + eps)
+            b = 1.0 / (1.0 - t_view + eps)
+        else:
+            raise ValueError(f"Unknown boundary_type: {self.boundary_type}")
 
-        # Constant C (can be learned or fixed)
-        C = torch.zeros_like(z)  # Target is "clean" image
-
-        # Parameterized output
-        output = g_t * (C - z) + f_t * z + h_t * raw_output
-
-        return output
-
-    def _subtraction_parameterization(
-        self,
-        z: torch.Tensor,
-        t: torch.Tensor,
-        raw_output: torch.Tensor,
-    ) -> torch.Tensor:
-        """
-        Subtraction-based boundary parameterization.
-
-        v(x,t) = x + (1-t) * f_theta(x,t)
-
-        At t=1: v(x,1) = x (identity)
-        """
-        t = t.view(-1, 1, 1, 1)
-
-        # Scale network output by (1-t)
-        output = z + (1.0 - t) * raw_output
-
-        return output
+        return a, b
 
     def forward(
         self,
-        z: torch.Tensor,
+        x_t: torch.Tensor,
         class_labels: Optional[torch.Tensor] = None,
         t: Optional[torch.Tensor] = None,
         augment_labels: Optional[torch.Tensor] = None,
+        return_velocity: bool = False,
     ) -> torch.Tensor:
         """
         Generate images with boundary condition enforcement.
 
+        Forward pass:
+        1. Network predicts denoised output D_θ(x_t, t) using EDM preconditioning
+        2. Compute velocity: v = (D_θ - x_t) / (1 - t) with boundary enforcement
+        3. Generate: x_1 = x_t + (1 - t) * v
+
         Args:
-            z: Input noise (B, C, H, W)
+            x_t: Input (B, C, H, W) - noise z for t=0, interpolated for 0<t<1
             class_labels: Optional class labels
-            t: Time values (B,), defaults to sigma_data
+            t: Time values (B,) in [0, 1], defaults to 0 for one-step generation
             augment_labels: Optional augmentation labels
+            return_velocity: If True, return velocity instead of generated image
 
         Returns:
-            Generated images with boundary conditions satisfied
+            Generated images x_1 (or velocity if return_velocity=True)
         """
-        z = z.to(torch.float32)
-        batch_size = z.shape[0]
-        device = z.device
+        x_t = x_t.to(torch.float32)
+        batch_size = x_t.shape[0]
+        device = x_t.device
 
-        # Default time to sigma_data (one-step generation)
+        # Default time to 0 for one-step generation from pure noise
         if t is None:
-            t = torch.ones(batch_size, device=device) * self.sigma_data
+            t = torch.zeros(batch_size, device=device)
 
-        # Preconditioning
-        sigma = t * self.sigma_data
+        t_view = t.view(-1, 1, 1, 1)
+
+        # EDM-style preconditioning for stable training
+        # Map t to sigma: t=0 → high sigma (noise), t=1 → low sigma (data)
+        # Use sigma = sigma_data * (1-t) for smooth mapping
+        sigma = self.sigma_data * (1.0 - t) + 1e-5  # Avoid sigma=0
         dtype = torch.float16 if (self.use_fp16 and device.type == 'cuda') else torch.float32
 
+        # EDM preconditioning coefficients
         c_skip = self.sigma_data ** 2 / (sigma ** 2 + self.sigma_data ** 2)
         c_out = sigma * self.sigma_data / (sigma ** 2 + self.sigma_data ** 2).sqrt()
-        c_in = 1 / (self.sigma_data ** 2 + sigma ** 2).sqrt()
+        c_in = 1.0 / (self.sigma_data ** 2 + sigma ** 2).sqrt()
         c_noise = sigma.log() / 4
 
         c_skip = c_skip.view(-1, 1, 1, 1)
         c_out = c_out.view(-1, 1, 1, 1)
         c_in = c_in.view(-1, 1, 1, 1)
 
-        # Network forward pass
-        x_in = (c_in * z * sigma.view(-1, 1, 1, 1)).to(dtype)
-        raw_output = self.model(x_in, c_noise, class_labels, augment_labels)
-        raw_output = raw_output.to(torch.float32)
+        # Network forward pass with preconditioning
+        x_in = (c_in * x_t).to(dtype)
+        F_x = self.model(x_in, c_noise, class_labels, augment_labels)
+        F_x = F_x.to(torch.float32)
 
-        # Apply boundary parameterization
-        if self.boundary_type == "mask":
-            x = self._mask_parameterization(z, t, c_skip * z + c_out * raw_output)
-        elif self.boundary_type == "subtraction":
-            x = self._subtraction_parameterization(z, t, c_out * raw_output)
+        # EDM denoiser: D_θ(x, σ) = c_skip * x + c_out * F_θ(c_in * x, c_noise)
+        D_x = c_skip * x_t + c_out * F_x
+
+        # Compute velocity with boundary parameterization
+        if self.boundary_type == "none":
+            # Direct velocity: v = D_θ - x_t (assumes D_θ predicts x_1)
+            v = D_x - x_t
+        elif self.boundary_type == "mask":
+            # Masked velocity: scale by (1-t) to enforce v→0 as t→1
+            # v = (1-t) * (D_θ - x_t)
+            v = (1.0 - t_view) * (D_x - x_t)
+        elif self.boundary_type == "affine":
+            # Affine boundary: v = (D_θ - x_t) / (1 - t + eps)
+            # Then multiply by (1-t) when integrating: x_1 = x_t + (1-t)*v
+            # Net effect: x_1 = x_t + (D_θ - x_t) = D_θ
+            # This naturally satisfies boundary conditions:
+            # - At t=0: x_1 = D_θ(z, 0) (full network prediction)
+            # - At t→1: D_θ(x_1, 1) ≈ x_1, so x_1 ≈ x_1 (identity)
+            v = (D_x - x_t) / (1.0 - t_view + 1e-5)
         else:
-            # Fallback to standard EDM preconditioning
-            x = c_skip * z + c_out * raw_output
+            raise ValueError(f"Unknown boundary_type: {self.boundary_type}")
 
-        return x
+        if return_velocity:
+            return v
+
+        # One-step generation: x_1 = x_t + (1-t) * v
+        # For affine: this simplifies to x_1 = D_θ (the denoised prediction)
+        # For mask: x_1 = x_t + (1-t)^2 * (D_θ - x_t)
+        # For none: x_1 = x_t + (1-t) * (D_θ - x_t)
+        if self.boundary_type == "affine":
+            # Direct prediction - clean formulation
+            x_1 = D_x
+        else:
+            x_1 = x_t + (1.0 - t_view) * v
+
+        return x_1
 
     @torch.no_grad()
     def sample(
@@ -776,14 +814,16 @@ class BoundaryConditionedGenerator(nn.Module):
         )
 
         if num_steps == 1:
-            return self.forward(z, class_labels)
+            # One-step: directly predict x_1 from z (t=0)
+            t = torch.zeros(batch_size, device=device)
+            return self.forward(z, class_labels, t)
 
-        # Multi-step Euler integration
+        # Multi-step Euler integration from t=0 to t=1
         x = z
         dt = 1.0 / num_steps
         for i in range(num_steps):
-            t = torch.ones(batch_size, device=device) * (1.0 - i * dt)
-            v = self.forward(x, class_labels, t) - x
+            t = torch.ones(batch_size, device=device) * (i * dt)
+            v = self.forward(x, class_labels, t, return_velocity=True)
             x = x + v * dt
 
         return x

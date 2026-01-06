@@ -481,6 +481,150 @@ class SemiDiscreteOTSolverV2:
         self.update_count = 0
 
 
+class SoftMatchingModule(nn.Module):
+    """
+    Soft OT matching with temperature annealing.
+
+    Key insight from curriculum learning:
+    - Start with high temperature (soft assignments) for exploration
+    - Anneal to low temperature (sharp assignments) for exploitation
+    - This prevents mode collapse and improves coverage
+
+    Assignment types:
+    - "softmax": Soft assignment using temperature-scaled softmax
+    - "gumbel": Gumbel-softmax for differentiable sampling
+    - "sinkhorn": Use Sinkhorn coupling directly as soft weights
+    """
+
+    def __init__(
+        self,
+        temperature_init: float = 1.0,
+        temperature_final: float = 0.1,
+        anneal_steps: int = 50000,
+        assignment_type: str = "softmax",
+        use_gumbel_hard: bool = False,  # Straight-through estimator
+    ):
+        super().__init__()
+        self.temperature_init = temperature_init
+        self.temperature_final = temperature_final
+        self.anneal_steps = anneal_steps
+        self.assignment_type = assignment_type
+        self.use_gumbel_hard = use_gumbel_hard
+
+        # Track current temperature
+        self.register_buffer('current_temperature', torch.tensor(temperature_init))
+        self.register_buffer('step_counter', torch.tensor(0))
+
+    def get_temperature(self, step: Optional[int] = None) -> float:
+        """Get temperature with exponential annealing."""
+        if step is None:
+            step = self.step_counter.item()
+
+        if step >= self.anneal_steps:
+            return self.temperature_final
+
+        # Exponential annealing
+        progress = step / self.anneal_steps
+        log_ratio = np.log(self.temperature_final / self.temperature_init)
+        temperature = self.temperature_init * np.exp(log_ratio * progress)
+
+        return temperature
+
+    def update_step(self, step: int):
+        """Update internal step counter."""
+        self.step_counter.fill_(step)
+        self.current_temperature.fill_(self.get_temperature(step))
+
+    def soft_assignment(
+        self,
+        cost_matrix: torch.Tensor,
+        coupling: Optional[torch.Tensor] = None,
+        temperature: Optional[float] = None,
+    ) -> torch.Tensor:
+        """
+        Compute soft assignment weights.
+
+        Args:
+            cost_matrix: Cost matrix (n, m)
+            coupling: OT coupling from Sinkhorn (n, m), optional
+            temperature: Override temperature
+
+        Returns:
+            Soft assignment weights (n, m)
+        """
+        temp = temperature if temperature is not None else self.current_temperature.item()
+        n, m = cost_matrix.shape
+        device = cost_matrix.device
+
+        if self.assignment_type == "softmax":
+            # Temperature-scaled softmax over negative costs
+            # Lower cost = higher weight
+            logits = -cost_matrix / temp
+            weights = F.softmax(logits, dim=1)
+
+        elif self.assignment_type == "gumbel":
+            # Gumbel-softmax for differentiable sampling
+            logits = -cost_matrix / temp
+
+            if self.training:
+                # Add Gumbel noise
+                gumbel_noise = -torch.log(-torch.log(torch.rand_like(logits) + 1e-10) + 1e-10)
+                logits = logits + gumbel_noise
+
+            weights = F.softmax(logits, dim=1)
+
+            if self.use_gumbel_hard:
+                # Straight-through estimator
+                hard = torch.zeros_like(weights).scatter_(1, weights.argmax(dim=1, keepdim=True), 1.0)
+                weights = hard - weights.detach() + weights
+
+        elif self.assignment_type == "sinkhorn":
+            # Use Sinkhorn coupling directly, but temperature-scale it
+            if coupling is not None:
+                # Sharpen the coupling with temperature
+                log_coupling = torch.log(coupling + 1e-10)
+                weights = F.softmax(log_coupling / temp, dim=1)
+            else:
+                # Fall back to softmax
+                logits = -cost_matrix / temp
+                weights = F.softmax(logits, dim=1)
+
+        else:
+            # Default: argmax (hard assignment)
+            weights = torch.zeros(n, m, device=device)
+            weights.scatter_(1, cost_matrix.argmin(dim=1, keepdim=True), 1.0)
+
+        return weights
+
+    def get_soft_targets(
+        self,
+        weights: torch.Tensor,
+        targets: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Compute soft targets using assignment weights.
+
+        Args:
+            weights: Soft assignment weights (n, m)
+            targets: Target images/features (m, ...)
+
+        Returns:
+            Soft targets (n, ...)
+        """
+        # weights: (n, m), targets: (m, C, H, W) or (m, d)
+        if targets.dim() == 4:
+            # Image targets: (m, C, H, W)
+            m, C, H, W = targets.shape
+            targets_flat = targets.view(m, -1)  # (m, C*H*W)
+            soft_targets = torch.mm(weights, targets_flat)  # (n, C*H*W)
+            soft_targets = soft_targets.view(-1, C, H, W)  # (n, C, H, W)
+        else:
+            # Feature targets: (m, d)
+            soft_targets = torch.mm(weights, targets)  # (n, d)
+
+        return soft_targets
+
+
 class OTMatchingModuleV2(nn.Module):
     """
     Enhanced OT matching module for GFGW-FM training.
@@ -489,6 +633,7 @@ class OTMatchingModuleV2(nn.Module):
     - Adaptive epsilon scheduling
     - FGW lambda scheduling
     - Hungarian matching option
+    - Soft matching with temperature annealing (NEW)
     - Improved numerical stability
     """
 
@@ -506,6 +651,12 @@ class OTMatchingModuleV2(nn.Module):
         use_hungarian: bool = False,
         use_unbalanced: bool = False,
         unbalanced_reg: float = 1.0,
+        # NEW: Soft matching parameters
+        use_soft_matching: bool = False,
+        soft_temperature_init: float = 1.0,
+        soft_temperature_final: float = 0.1,
+        soft_anneal_steps: int = 50000,
+        soft_assignment_type: str = "softmax",
         device: torch.device = torch.device("cuda"),
     ):
         super().__init__()
@@ -513,6 +664,7 @@ class OTMatchingModuleV2(nn.Module):
         self.feature_dim = feature_dim
         self.num_data_points = num_data_points
         self.use_hungarian = use_hungarian
+        self.use_soft_matching = use_soft_matching
         self.device = device
 
         # FGW solver
@@ -539,6 +691,15 @@ class OTMatchingModuleV2(nn.Module):
         # Hungarian matcher
         if use_hungarian:
             self.hungarian = HungarianMatcher()
+
+        # NEW: Soft matching module
+        if use_soft_matching:
+            self.soft_matcher = SoftMatchingModule(
+                temperature_init=soft_temperature_init,
+                temperature_final=soft_temperature_final,
+                anneal_steps=soft_anneal_steps,
+                assignment_type=soft_assignment_type,
+            )
 
     def forward(
         self,
@@ -638,6 +799,73 @@ class OTMatchingModuleV2(nn.Module):
         # FGW distance = <C, P>
         distance = (coupling * cost_matrix).sum()
         return distance
+
+    def update_soft_matching_step(self, step: int):
+        """Update soft matching temperature for curriculum learning."""
+        if self.use_soft_matching and hasattr(self, 'soft_matcher'):
+            self.soft_matcher.update_step(step)
+
+    def get_soft_matched_targets(
+        self,
+        features_gen: torch.Tensor,
+        features_real: torch.Tensor,
+        real_data: torch.Tensor,
+        D_gen: Optional[torch.Tensor] = None,
+        D_real: Optional[torch.Tensor] = None,
+        epsilon: Optional[float] = None,
+        fgw_lambda: Optional[float] = None,
+        temperature: Optional[float] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Get soft-matched targets using temperature-annealed assignments.
+
+        Unlike get_matched_pairs which uses hard argmax, this uses soft
+        weighted combinations for curriculum learning.
+
+        Args:
+            features_gen: Generated features (n, d)
+            features_real: Real features (m, d)
+            real_data: Real images/targets (m, C, H, W) or (m, d)
+            D_gen: Distance matrix for generated
+            D_real: Distance matrix for real
+            epsilon: Override epsilon
+            fgw_lambda: Override FGW lambda
+            temperature: Override temperature (uses scheduled if None)
+
+        Returns:
+            (soft_targets, soft_weights, coupling)
+            - soft_targets: Weighted combination of targets (n, ...)
+            - soft_weights: Assignment weights (n, m)
+            - coupling: OT coupling matrix (n, m)
+        """
+        # Compute FGW coupling
+        coupling, cost_matrix = self.forward(
+            features_gen, features_real, D_gen, D_real,
+            epsilon=epsilon, fgw_lambda=fgw_lambda,
+        )
+
+        if self.use_soft_matching and hasattr(self, 'soft_matcher'):
+            # Use soft matching with temperature annealing
+            soft_weights = self.soft_matcher.soft_assignment(
+                cost_matrix, coupling, temperature
+            )
+            soft_targets = self.soft_matcher.get_soft_targets(soft_weights, real_data)
+        else:
+            # Fall back to hard assignment
+            assignments = coupling.argmax(dim=1)
+            soft_targets = real_data[assignments]
+            # Create one-hot weights
+            n, m = coupling.shape
+            soft_weights = torch.zeros(n, m, device=coupling.device)
+            soft_weights.scatter_(1, assignments.unsqueeze(1), 1.0)
+
+        return soft_targets, soft_weights, coupling
+
+    def get_current_temperature(self) -> float:
+        """Get current soft matching temperature."""
+        if self.use_soft_matching and hasattr(self, 'soft_matcher'):
+            return self.soft_matcher.current_temperature.item()
+        return 0.0  # No soft matching
 
 
 # ============================================================================

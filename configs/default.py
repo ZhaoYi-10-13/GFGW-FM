@@ -80,6 +80,13 @@ class OTConfig:
     coupling_temperature: float = 0.1  # Temperature for soft coupling -> hard assignment
     use_hungarian: bool = False  # Use Hungarian algorithm for exact assignment
 
+    # [NEW] Soft OT matching with temperature annealing (curriculum learning)
+    use_soft_matching: bool = True  # Enable soft weighted targets instead of hard argmax
+    soft_temperature_init: float = 1.0  # Initial temperature (high = soft assignments)
+    soft_temperature_final: float = 0.1  # Final temperature (low = sharp assignments)
+    soft_anneal_steps: int = 50000  # Steps to anneal from init to final temperature
+    soft_assignment_type: str = "softmax"  # "softmax", "gumbel", or "sinkhorn"
+
 
 @dataclass
 class LossConfig:

@@ -339,19 +339,21 @@ class GFGWFMTrainerV2:
         3. Apply augmentations
         4. Compute features and solve FGW OT
         5. Get matched targets
-        6. Compute comprehensive loss
+        6. Compute comprehensive loss (with consistency from EMA)
         7. Update parameters
         """
         batch_size = real_images.shape[0]
         device = real_images.device
 
-        # Get current schedule values
-        schedule_state = self.scheduler.get_state(self.cur_step)
+        # [FIX] Use cur_nimg instead of cur_step for scheduler
+        # Scheduler expects steps in terms of images (kimg * 1000), not iterations
+        schedule_state = self.scheduler.get_state(self.cur_nimg)
         current_epsilon = schedule_state['epsilon']
         current_fgw_lambda = schedule_state['fgw_lambda']
 
         # Sample time values (using heavy-tailed distribution)
-        t = self.scheduler.sample_time(batch_size, device, self.cur_step)
+        # [FIX] Pass cur_nimg for proper two-stage scheduling
+        t = self.scheduler.sample_time(batch_size, device, self.cur_nimg)
 
         # Step 1: Sample latent codes and generate images
         z = torch.randn_like(real_images)
@@ -418,6 +420,28 @@ class GFGWFMTrainerV2:
 
             features_gen_grad = self.feature_extractor.forward(generated)
 
+            # [FIX] Compute EMA output for consistency loss (ECM/TCM style)
+            # Sample a nearby time point for consistency
+            ema_output = None
+            t_ema = None
+            if self.config.loss.use_consistency_loss and self.ema_generator is not None:
+                with torch.no_grad():
+                    # Sample t_ema slightly different from t for consistency
+                    # TCM uses adjacent time steps along trajectory
+                    delta_t = torch.rand(batch_size, device=device) * 0.1  # Small random offset
+                    t_ema = (t - delta_t).clamp(self.config.schedule.t_min, self.config.schedule.t_max)
+
+                    # Compute interpolated point at t_ema along trajectory
+                    # x_t_ema = (1 - t_ema) * z + t_ema * x  (linear interpolation)
+                    t_ema_view = t_ema.view(-1, 1, 1, 1)
+                    x_t_ema = (1 - t_ema_view) * z + t_ema_view * matched_targets
+
+                    # EMA model predicts clean data from interpolated point
+                    if isinstance(self.ema_generator, BoundaryConditionedGenerator):
+                        ema_output = self.ema_generator(x_t_ema, real_labels, t_ema)
+                    else:
+                        ema_output = self.ema_generator(x_t_ema, real_labels)
+
             # Comprehensive loss with all components
             # NOTE: For structure loss, we need the full memory_features, not just matched ones
             losses = self.loss_fn(
@@ -429,6 +453,8 @@ class GFGWFMTrainerV2:
                 coupling=coupling,
                 noise=z,
                 t=t,
+                ema_output=ema_output,  # [FIX] Pass EMA output for consistency loss
+                t_ema=t_ema,  # [FIX] Pass t_ema for consistency weighting
             )
 
         # Step 6: Backward pass with mixed precision
@@ -493,7 +519,7 @@ class GFGWFMTrainerV2:
             use_cosine=self.config.ot.use_cosine_distance
         )
 
-        # Initialize OT solver
+        # Initialize OT solver with soft matching for curriculum learning
         self.ot_solver = OTMatchingModule(
             feature_dim=self.config.dino.feature_dim,
             num_data_points=self.memory_bank.num_valid,
@@ -503,6 +529,12 @@ class GFGWFMTrainerV2:
             num_fgw_iters=self.config.ot.num_fgw_iters,
             use_cosine_distance=self.config.ot.use_cosine_distance,
             dual_lr=self.config.ot.dual_lr,
+            # Soft matching with temperature annealing (curriculum learning)
+            use_soft_matching=self.config.ot.use_soft_matching,
+            soft_temperature_init=self.config.ot.soft_temperature_init,
+            soft_temperature_final=self.config.ot.soft_temperature_final,
+            soft_anneal_steps=self.config.ot.soft_anneal_steps,
+            soft_assignment_type=self.config.ot.soft_assignment_type,
             device=self.device,
         )
 
@@ -510,6 +542,11 @@ class GFGWFMTrainerV2:
         self.print0(f"Two-stage training: {self.config.schedule.use_two_stage}")
         self.print0(f"Time sampling: {self.config.schedule.time_sampling}")
         self.print0(f"Mixed precision: {self.use_amp}")
+        self.print0(f"Soft OT matching: {self.config.ot.use_soft_matching}")
+        if self.config.ot.use_soft_matching:
+            self.print0(f"  Temperature: {self.config.ot.soft_temperature_init} -> {self.config.ot.soft_temperature_final}")
+            self.print0(f"  Assignment type: {self.config.ot.soft_assignment_type}")
+            self.print0(f"  Anneal steps: {self.config.ot.soft_anneal_steps}")
 
         # Training loop
         cur_tick = 0
@@ -543,7 +580,8 @@ class GFGWFMTrainerV2:
             indices = indices.to(self.device)
 
             # Update learning rate
-            current_lr = self.scheduler.step_optimizer(self.optimizer, self.cur_step)
+            # [FIX] Use cur_nimg for LR scheduling (kimg * 1000 scale)
+            current_lr = self.scheduler.step_optimizer(self.optimizer, self.cur_nimg)
 
             # Training step
             losses = self.train_step(images, labels, indices)
@@ -553,14 +591,21 @@ class GFGWFMTrainerV2:
             self._update_ema(self.cur_nimg)
             self._update_teacher(self.cur_step)
 
+            # Update soft matching temperature for curriculum learning
+            if self.config.ot.use_soft_matching and hasattr(self.ot_solver, 'update_soft_matching_step'):
+                self.ot_solver.update_soft_matching_step(self.cur_nimg)
+
             # Logging
             cur_kimg = self.cur_nimg // 1000
 
             if cur_kimg > cur_tick:
                 elapsed = time.time() - tick_start_time
-                schedule_state = self.scheduler.get_state(self.cur_step)
+                schedule_state = self.scheduler.get_state(self.cur_nimg)
 
-                self.print0(
+                # Get soft matching temperature if enabled
+                soft_temp = self.ot_solver.get_current_temperature() if self.config.ot.use_soft_matching else None
+
+                log_msg = (
                     f"kimg {cur_kimg:>6d} | "
                     f"loss {losses['total_loss']:.4f} | "
                     f"flow {losses['flow_loss']:.4f} | "
@@ -570,8 +615,11 @@ class GFGWFMTrainerV2:
                     f"t_range {schedule_state['time_range']} | "
                     f"sec/kimg {elapsed:.1f}"
                 )
+                if soft_temp is not None:
+                    log_msg += f" | temp {soft_temp:.3f}"
+                self.print0(log_msg)
 
-                self._log_stats({
+                stats = {
                     'kimg': cur_kimg,
                     'step': self.cur_step,
                     'loss': losses['total_loss'],
@@ -581,7 +629,10 @@ class GFGWFMTrainerV2:
                     'epsilon': schedule_state['epsilon'],
                     'fgw_lambda': schedule_state['fgw_lambda'],
                     'timestamp': time.time(),
-                })
+                }
+                if soft_temp is not None:
+                    stats['soft_temperature'] = soft_temp
+                self._log_stats(stats)
 
                 cur_tick = cur_kimg
                 tick_start_time = time.time()
