@@ -256,7 +256,7 @@ class EvalConfig:
     """Evaluation configuration."""
     fid_num_samples: int = 50000
     tcs_num_samples: int = 10000
-    eval_every_kimg: int = 10000
+    eval_every_kimg: int = 1000
     sample_every_kimg: int = 1000
 
     # [NEW] Enhanced evaluation
@@ -273,7 +273,7 @@ class LogConfig:
     """Logging configuration."""
     run_dir: str = "./runs"
     log_every: int = 100
-    save_every_kimg: int = 10000
+    save_every_kimg: int = 1000
     keep_checkpoints: int = 5
 
     # [NEW] Enhanced logging
